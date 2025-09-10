@@ -590,12 +590,51 @@ impl Catalog for S3TablesCatalog {
 
     /// Updates an existing table within the s3tables catalog.
     ///
-    /// This function is still in development and will always return an error.
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    /// This implementation follows the standard Iceberg catalog pattern:
+    /// 1. Load the current table
+    /// 2. Apply the commit (validates requirements and applies updates)
+    /// 3. Write new metadata to file storage
+    /// 4. Update S3 Tables metadata location pointer
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        // Load the current table
+        let current_table = self.load_table(commit.identifier()).await?;
+        
+        // Apply TableCommit to get staged table (this validates requirements and applies updates)
+        let staged_table = commit.apply(current_table)?;
+        
+        // Write table metadata to the new location
+        staged_table
+            .metadata()
+            .write_to(
+                staged_table.file_io(),
+                staged_table.metadata_location_result()?,
+            )
+            .await?;
+
+        // Get the current table info to obtain the version token
+        let current_table_info = self
+            .s3tables_client
+            .get_table()
+            .table_bucket_arn(&self.config.table_bucket_arn)
+            .namespace(staged_table.identifier().namespace().to_url_string())
+            .name(staged_table.identifier().name())
+            .send()
+            .await
+            .map_err(from_aws_sdk_error)?;
+
+        // Update metadata location in S3 Tables
+        self.s3tables_client
+            .update_table_metadata_location()
+            .table_bucket_arn(&self.config.table_bucket_arn)
+            .namespace(staged_table.identifier().namespace().to_url_string())
+            .name(staged_table.identifier().name())
+            .metadata_location(staged_table.metadata_location_result()?)
+            .version_token(current_table_info.version_token())
+            .send()
+            .await
+            .map_err(from_aws_sdk_error)?;
+
+        Ok(staged_table)
     }
 }
 
